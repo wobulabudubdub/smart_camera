@@ -1,0 +1,635 @@
+diff --git a/drivers/iio/temperature/Kconfig b/drivers/iio/temperature/Kconfig
+index 82e4a6274..64811efff 100644
+--- a/drivers/iio/temperature/Kconfig
++++ b/drivers/iio/temperature/Kconfig
+@@ -55,6 +55,23 @@ config MLX90632
+ 	  This driver can also be built as a module. If so, the module will
+ 	  be called mlx90632.
+ 
++config MLX90640
++	tristate "MLX90640 32x24 thermal array sensor"
++	depends on I2C
++	select IIO_BUFFER
++	select IIO_TRIGGERED_BUFFER
++	help
++	  If you say yes here you get support for the Melexis
++	  MLX90640 32x24 pixel IR thermal array sensor connected
++	  via I2C.
++
++	  This sensor provides 768-pixel thermal images and is
++	  commonly used in thermal cameras, people detection,
++	  and temperature monitoring applications.
++
++	  This driver can also be built as a module. If so, the module will
++	  be called mlx90640.
++
+ config TMP006
+ 	tristate "TMP006 infrared thermopile sensor"
+ 	depends on I2C
+diff --git a/drivers/iio/temperature/Makefile b/drivers/iio/temperature/Makefile
+index 34a31db0b..388dbf14e 100644
+--- a/drivers/iio/temperature/Makefile
++++ b/drivers/iio/temperature/Makefile
+@@ -7,6 +7,7 @@ obj-$(CONFIG_HID_SENSOR_TEMP) += hid-sensor-temperature.o
+ obj-$(CONFIG_MAXIM_THERMOCOUPLE) += maxim_thermocouple.o
+ obj-$(CONFIG_MLX90614) += mlx90614.o
+ obj-$(CONFIG_MLX90632) += mlx90632.o
++obj-$(CONFIG_MLX90640) += mlx90640.o
+ obj-$(CONFIG_TMP006) += tmp006.o
+ obj-$(CONFIG_TMP007) += tmp007.o
+ obj-$(CONFIG_TSYS01) += tsys01.o
+diff --git a/drivers/iio/temperature/mlx90640.c b/drivers/iio/temperature/mlx90640.c
+new file mode 100644
+index 000000000..971be4566
+--- /dev/null
++++ b/drivers/iio/temperature/mlx90640.c
+@@ -0,0 +1,589 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * mlx90640.c - Melexis MLX90640 32x24 thermal array sensor driver
++ *
++ * Copyright (c) 2024
++ *
++ * 32x24 pixel (768 total) IR thermal array sensor with I2C interface.
++ * Factory-calibrated via on-chip EEPROM.
++ *
++ * IIO interfaces:
++ *   - Ambient temperature: in_temp_ambient_input (millidegree C)
++ *   - Pixel temperature:    in_temp_object0_input through object767_input
++ *   - Full frame:           /sys/bus/iio/devices/iio:device0/frame_data
++ *   - Triggered buffer:     /dev/iio:device0 (769 x s32 per scan)
++ *
++ * I2C address: 0x33 (7-bit)
++ */
++
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/i2c.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/slab.h>
++#include <linux/bitops.h>
++#include <linux/math64.h>
++
++#include <linux/iio/iio.h>
++#include <linux/iio/sysfs.h>
++#include <linux/iio/buffer.h>
++#include <linux/iio/trigger_consumer.h>
++#include <linux/iio/triggered_buffer.h>
++
++#define MLX90640_EE_BASE		0x2400
++#define MLX90640_EE_SIZE		832
++
++/* EEPROM common calibration registers (offsets from EE_BASE) */
++#define MLX90640_EE_CTRL1		0x00
++#define MLX90640_EE_I2C_ADDR		0x02
++#define MLX90640_EE_ID0			0x03
++#define MLX90640_EE_K_V_CP		0x04
++#define MLX90640_EE_K_TA_CP		0x06
++#define MLX90640_EE_ALPHA_CP		0x0A
++#define MLX90640_EE_OFFSET_CP		0x0C
++
++/* EEPROM calibration data region */
++#define MLX90640_EE_PIXEL_OFFSET	0x10	/* 768 s16 offsets */
++#define MLX90640_EE_ALPHA_SCALE		0x310	/* per-pixel alpha scale ref */
++#define MLX90640_EE_K_V_DATA		0x320	/* per-pixel K_V ref */
++#define MLX90640_EE_K_TA_DATA		0x330	/* per-pixel K_Ta ref */
++#define MLX90640_EE_PTAT_K_V		0x20	/* PTAT K_V for Ta calc */
++#define MLX90640_EE_PTAT_25		0x21	/* PTAT value at 25C */
++
++/* RAM addresses */
++#define MLX90640_RAM_BASE		0x0400
++#define MLX90640_RAM_PIXEL_START	0x0400
++#define MLX90640_RAM_TA			0x0700
++#define MLX90640_RAM_TABLE_NUMBER	0x0708	/* bit0 = sub-page */
++
++#define MLX90640_COLS			32
++#define MLX90640_ROWS			24
++#define MLX90640_PIXELS			768
++
++#define MLX90640_REFRESH_MASK		GENMASK(10, 7)
++#define MLX90640_REFRESH_SHIFT		7
++
++/*
++ * Sensor data structure.
++ *
++ * To support IIO triggered buffer with all 768 pixel temperatures,
++ * we build the channel array dynamically: 1 ambient channel +
++ * 768 pixel channels. Each channel has scan_index matching its
++ * position in the buffer, so the total scan is 769 x s32.
++ */
++struct mlx90640_data {
++	struct i2c_client *client;
++	struct mutex lock;
++	u16 ee[MLX90640_EE_SIZE];
++	s16 offset[MLX90640_PIXELS];
++	s16 alpha[MLX90640_PIXELS];
++	s16 k_v[MLX90640_PIXELS];
++	s16 k_ta[MLX90640_PIXELS];
++	s32 temp_frame[MLX90640_PIXELS];
++	s32 ambient_temp;
++	u8 resolution;
++	u8 refresh_rate;
++	/* Dynamically allocated channel array */
++	struct iio_chan_spec *channels;
++};
++
++/* ------------------------------------------------------------------ */
++/* I2C helpers                                                        */
++/* ------------------------------------------------------------------ */
++
++static int mlx90640_i2c_read_block(struct mlx90640_data *data,
++				    u16 reg, u16 *buf, int len)
++{
++	struct i2c_client *client = data->client;
++	struct i2c_msg msg[2];
++	u8 reg_bytes[2];
++	int ret;
++
++	reg_bytes[0] = (reg >> 8) & 0xff;
++	reg_bytes[1] = reg & 0xff;
++
++	msg[0].addr  = client->addr;
++	msg[0].flags = 0;
++	msg[0].len   = 2;
++	msg[0].buf   = reg_bytes;
++
++	msg[1].addr  = client->addr;
++	msg[1].flags = I2C_M_RD;
++	msg[1].len   = len * 2;
++	msg[1].buf   = (u8 *)buf;
++
++	ret = i2c_transfer(client->adapter, msg, 2);
++	if (ret < 0)
++		return ret;
++	if (ret != 2)
++		return -EIO;
++
++	while (len--) {
++		*buf = be16_to_cpu(*buf);
++		buf++;
++	}
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* EEPROM calibration                                                 */
++/* ------------------------------------------------------------------ */
++
++static int mlx90640_read_eeprom(struct mlx90640_data *data)
++{
++	struct i2c_client *client = data->client;
++	u16 test_val;
++	int ret, i;
++
++	/*
++	 * First, read a single RAM register (ambient temp) to wake up
++	 * the sensor and verify I2C communication works.
++	 */
++	ret = mlx90640_i2c_read_block(data, MLX90640_RAM_TA, &test_val, 1);
++	if (ret < 0) {
++		dev_err(&client->dev,
++			"RAM read test failed: %d\n", ret);
++		return ret;
++	}
++	dev_info(&client->dev, "RAM read OK (Ta raw=0x%04x), reading EEPROM...\n",
++		 test_val);
++
++	/* Read EEPROM word by word (MLX90640 may need single-word reads) */
++	for (i = 0; i < MLX90640_EE_SIZE; i++) {
++		ret = mlx90640_i2c_read_block(data,
++					      MLX90640_EE_BASE + i,
++					      data->ee + i, 1);
++		if (ret < 0) {
++			dev_err(&client->dev,
++				"EEPROM word 0x%04x failed: %d\n",
++				MLX90640_EE_BASE + i, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static int mlx90640_extract_calibration(struct mlx90640_data *data)
++{
++	u16 *ee = data->ee;
++	u16 id0 = ee[MLX90640_EE_ID0];
++	s16 alpha_cp, k_v_cp, k_ta_cp;
++	int i;
++
++	data->resolution = (id0 >> 8) & 0x03;
++	data->refresh_rate = (ee[MLX90640_EE_CTRL1] & MLX90640_REFRESH_MASK)
++			     >> MLX90640_REFRESH_SHIFT;
++
++	/* Common calibration references */
++	k_v_cp   = (s16)ee[MLX90640_EE_K_V_CP];
++	k_ta_cp  = (s16)ee[MLX90640_EE_K_TA_CP];
++	alpha_cp = (s16)ee[MLX90640_EE_ALPHA_CP];
++
++	dev_dbg(&data->client->dev,
++		"EEPROM: res=%d refresh=%d k_v=%d k_ta=%d alpha=%d\n",
++		data->resolution, data->refresh_rate,
++		k_v_cp, k_ta_cp, alpha_cp);
++
++	/*
++	 * Extract per-pixel calibration.
++	 *
++	 * MLX90640 EEPROM layout:
++	 *   Offsets: 0x2410-0x270F, 384 words, each holds 2 x s8 pixel offsets
++	 *     - Even pixel offset in lower byte, odd pixel offset in upper byte
++	 *   Alpha/K_V/K_Ta: shared per block (use common values as fallback)
++	 */
++	for (i = 0; i < MLX90640_PIXELS; i++) {
++		int word_idx = MLX90640_EE_PIXEL_OFFSET + (i / 2);
++		u16 word = ee[word_idx];
++
++		if (i & 1)
++			data->offset[i] = (s8)(word >> 8);   /* odd pixel: upper byte */
++		else
++			data->offset[i] = (s8)(word & 0xff);  /* even pixel: lower byte */
++
++		/* Use common calibration values per pixel (block-based sharing) */
++		data->alpha[i] = alpha_cp;
++		data->k_v[i]   = k_v_cp;
++		data->k_ta[i]  = k_ta_cp;
++	}
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* RAM frame reading                                                  */
++/* ------------------------------------------------------------------ */
++
++static int mlx90640_read_ram_frame(struct mlx90640_data *data,
++				    u16 *raw_pixels, u16 *ta_raw, u8 *subpage)
++{
++	u16 buf[772];
++	int ret;
++
++	ret = mlx90640_i2c_read_block(data, MLX90640_RAM_PIXEL_START,
++				       buf, 772);
++	if (ret < 0)
++		return ret;
++
++	memcpy(raw_pixels, buf, MLX90640_PIXELS * sizeof(u16));
++	*ta_raw  = buf[MLX90640_RAM_TA - MLX90640_RAM_BASE];
++	*subpage = buf[MLX90640_RAM_TABLE_NUMBER - MLX90640_RAM_BASE] & 0x01;
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Temperature calculation                                            */
++/* ------------------------------------------------------------------ */
++
++static s32 mlx90640_calc_ambient_temp(struct mlx90640_data *data, u16 ta_raw)
++{
++	u16 *ee = data->ee;
++	s32 kv_ptat, v_ptat_25;
++	s64 temp;
++
++	kv_ptat   = (s16)ee[MLX90640_EE_PTAT_K_V];
++	v_ptat_25 = (s16)ee[MLX90640_EE_PTAT_25];
++
++	if (kv_ptat == 0)
++		kv_ptat = 420;	/* typical: ~4.2 counts/K scaled x100 */
++
++	/* T_a = 25C + (raw - V_PTAT_25) * 10000 / K_V_PTAT */
++	temp = (s64)(ta_raw - v_ptat_25) * 10000;
++	temp = div_s64(temp, kv_ptat);
++
++	return 25000 + (s32)temp; /* millidegree C */
++}
++
++static s32 mlx90640_calc_pixel_temp(struct mlx90640_data *data,
++				     int pixel, u16 raw, s32 ta)
++{
++	/*
++	 * Simplified temperature calculation using raw IR values.
++	 * The raw value is proportional to IR radiation intensity.
++	 * We use the raw value directly scaled to millidegree C,
++	 * centered around the ambient temperature as baseline.
++	 */
++	s32 raw_signed = (s16)raw;
++	s32 offset = data->offset[pixel];
++	s32 signal = raw_signed - offset;
++
++	/*
++	 * Simple linear approximation:
++	 *   temp = ambient + signal * scale
++	 * where scale converts ADC counts to temperature (roughly 0.025°C/count)
++	 */
++	s32 temp = ta + signal * 25;  /* 25 millidegree per count */
++
++	/* Clamp to reasonable range */
++	if (temp < -40000) temp = -40000;
++	if (temp > 400000) temp = 400000;
++
++	return temp;
++}
++
++/* ------------------------------------------------------------------ */
++/* Full frame read (called from trigger handler and sysfs)            */
++/* ------------------------------------------------------------------ */
++
++static int mlx90640_read_frame(struct mlx90640_data *data)
++{
++	u16 raw_pixels[MLX90640_PIXELS];
++	u16 ta_raw;
++	u8 subpage;
++	int i, ret;
++
++	mutex_lock(&data->lock);
++
++	ret = mlx90640_read_ram_frame(data, raw_pixels, &ta_raw, &subpage);
++	if (ret < 0) {
++		dev_err(&data->client->dev,
++			"RAM read failed: %d\n", ret);
++		mutex_unlock(&data->lock);
++		return ret;
++	}
++
++	data->ambient_temp = mlx90640_calc_ambient_temp(data, ta_raw);
++
++	for (i = 0; i < MLX90640_PIXELS; i++)
++		data->temp_frame[i] = mlx90640_calc_pixel_temp(data, i,
++					raw_pixels[i], data->ambient_temp);
++
++	mutex_unlock(&data->lock);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* IIO sysfs read_raw                                                 */
++/* ------------------------------------------------------------------ */
++
++static int mlx90640_read_raw(struct iio_dev *indio_dev,
++			      struct iio_chan_spec const *channel,
++			      int *val, int *val2, long mask)
++{
++	struct mlx90640_data *data = iio_priv(indio_dev);
++	int ret;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_PROCESSED:
++		switch (channel->channel2) {
++		case IIO_MOD_TEMP_AMBIENT:
++			ret = mlx90640_read_frame(data);
++			if (ret < 0)
++				return ret;
++			*val = data->ambient_temp;
++			return IIO_VAL_INT;
++
++		case IIO_MOD_TEMP_OBJECT:
++			if (channel->channel >= MLX90640_PIXELS)
++				return -EINVAL;
++			ret = mlx90640_read_frame(data);
++			if (ret < 0)
++				return ret;
++			*val = data->temp_frame[channel->channel];
++			return IIO_VAL_INT;
++
++		default:
++			return -EINVAL;
++		}
++
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * Custom sysfs: frame_data
++ *
++ * Binary attribute returning the full thermal frame as 768 x s32
++ * (little-endian, millidegree C). One read = one complete frame.
++ * Size: 768 * 4 = 3072 bytes.
++ *
++ * Path: /sys/bus/iio/devices/iio:device0/frame_data
++ */
++static ssize_t mlx90640_frame_data_read(struct device *dev,
++					 struct device_attribute *attr,
++					 char *buf)
++{
++	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
++	struct mlx90640_data *data = iio_priv(indio_dev);
++	int ret;
++
++	ret = mlx90640_read_frame(data);
++	if (ret < 0)
++		return ret;
++
++	memcpy(buf, data->temp_frame, sizeof(data->temp_frame));
++
++	return sizeof(data->temp_frame);
++}
++
++static IIO_DEVICE_ATTR(frame_data, 0444, mlx90640_frame_data_read, NULL, 0);
++
++static struct attribute *mlx90640_attributes[] = {
++	&iio_dev_attr_frame_data.dev_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group mlx90640_attr_group = {
++	.attrs = mlx90640_attributes,
++};
++
++/* ------------------------------------------------------------------ */
++/* IIO channel specification                                          */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Build the channel array dynamically so the IIO buffer framework
++ * knows the exact scan layout: 1 ambient + 768 pixel temps = 769 x s32.
++ */
++static int mlx90640_build_channels(struct mlx90640_data *data)
++{
++	struct iio_chan_spec *ch;
++	int i;
++
++	data->channels = devm_kcalloc(&data->client->dev,
++				      1 + MLX90640_PIXELS,
++				      sizeof(*data->channels), GFP_KERNEL);
++	if (!data->channels)
++		return -ENOMEM;
++
++	ch = data->channels;
++
++	/* Channel 0: Ambient temperature */
++	ch[0].type			= IIO_TEMP;
++	ch[0].modified			= 1;
++	ch[0].channel2			= IIO_MOD_TEMP_AMBIENT;
++	ch[0].info_mask_separate	= BIT(IIO_CHAN_INFO_PROCESSED);
++	ch[0].scan_index		= 0;
++	ch[0].scan_type.sign		= 's';
++	ch[0].scan_type.realbits	= 32;
++	ch[0].scan_type.storagebits	= 32;
++	ch[0].scan_type.endianness	= IIO_CPU;
++
++	/* Channels 1..768: Per-pixel object temperatures */
++	for (i = 0; i < MLX90640_PIXELS; i++) {
++		ch[1 + i].type			= IIO_TEMP;
++		ch[1 + i].indexed		= 1;
++		ch[1 + i].modified		= 1;
++		ch[1 + i].channel		= i;
++		ch[1 + i].channel2		= IIO_MOD_TEMP_OBJECT;
++		ch[1 + i].info_mask_separate	= BIT(IIO_CHAN_INFO_PROCESSED);
++		ch[1 + i].scan_index		= 1 + i;
++		ch[1 + i].scan_type.sign	= 's';
++		ch[1 + i].scan_type.realbits	= 32;
++		ch[1 + i].scan_type.storagebits	= 32;
++		ch[1 + i].scan_type.endianness	= IIO_CPU;
++	}
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* IIO triggered buffer                                               */
++/* ------------------------------------------------------------------ */
++
++static irqreturn_t mlx90640_trigger_handler(int irq, void *p)
++{
++	struct iio_poll_func *pf = p;
++	struct iio_dev *indio_dev = pf->indio_dev;
++	struct mlx90640_data *data = iio_priv(indio_dev);
++	s32 *buf;
++	int i;
++
++	buf = kmalloc((1 + MLX90640_PIXELS) * sizeof(s32), GFP_KERNEL);
++	if (!buf)
++		goto out;
++
++	if (mlx90640_read_frame(data) < 0)
++		goto out_free;
++
++	buf[0] = data->ambient_temp;
++	for (i = 0; i < MLX90640_PIXELS; i++)
++		buf[1 + i] = data->temp_frame[i];
++
++	iio_push_to_buffers_with_timestamp(indio_dev, buf,
++					   iio_get_time_ns(indio_dev));
++out_free:
++	kfree(buf);
++out:
++	iio_trigger_notify_done(indio_dev->trig);
++	return IRQ_HANDLED;
++}
++
++static const struct iio_buffer_setup_ops mlx90640_buffer_setup_ops = { };
++
++static const struct iio_info mlx90640_info = {
++	.read_raw = mlx90640_read_raw,
++	.attrs = &mlx90640_attr_group,
++};
++
++/* ------------------------------------------------------------------ */
++/* Probe / Remove                                                     */
++/* ------------------------------------------------------------------ */
++
++static int mlx90640_probe(struct i2c_client *client,
++			   const struct i2c_device_id *id)
++{
++	struct iio_dev *indio_dev;
++	struct mlx90640_data *data;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return -EOPNOTSUPP;
++
++	indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*data));
++	if (!indio_dev)
++		return -ENOMEM;
++
++	data = iio_priv(indio_dev);
++	i2c_set_clientdata(client, indio_dev);
++	data->client = client;
++	mutex_init(&data->lock);
++
++	ret = mlx90640_read_eeprom(data);
++	if (ret < 0) {
++		dev_err(&client->dev, "EEPROM read failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = mlx90640_extract_calibration(data);
++	if (ret < 0) {
++		dev_err(&client->dev, "calibration extraction failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = mlx90640_build_channels(data);
++	if (ret < 0)
++		return ret;
++
++	indio_dev->dev.parent	= &client->dev;
++	indio_dev->name		= "mlx90640";
++	indio_dev->modes	= INDIO_DIRECT_MODE | INDIO_BUFFER_TRIGGERED;
++	indio_dev->info		= &mlx90640_info;
++	indio_dev->channels	= data->channels;
++	indio_dev->num_channels	= 1 + MLX90640_PIXELS;
++
++	ret = iio_triggered_buffer_setup(indio_dev, NULL,
++					  mlx90640_trigger_handler,
++					  &mlx90640_buffer_setup_ops);
++	if (ret < 0) {
++		dev_err(&client->dev, "buffer setup failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = iio_device_register(indio_dev);
++	if (ret < 0) {
++		dev_err(&client->dev, "IIO register failed: %d\n", ret);
++		iio_triggered_buffer_cleanup(indio_dev);
++		return ret;
++	}
++
++	dev_info(&client->dev,
++		 "MLX90640 probed: 32x24 pixels, refresh=%d\n",
++		 data->refresh_rate);
++
++	return 0;
++}
++
++static int mlx90640_remove(struct i2c_client *client)
++{
++	struct iio_dev *indio_dev = i2c_get_clientdata(client);
++
++	iio_device_unregister(indio_dev);
++	iio_triggered_buffer_cleanup(indio_dev);
++
++	return 0;
++}
++
++static const struct i2c_device_id mlx90640_id[] = {
++	{ "mlx90640", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, mlx90640_id);
++
++static const struct of_device_id mlx90640_of_match[] = {
++	{ .compatible = "melexis,mlx90640" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mlx90640_of_match);
++
++static struct i2c_driver mlx90640_driver = {
++	.driver = {
++		.name	= "mlx90640",
++		.of_match_table = mlx90640_of_match,
++	},
++	.probe		= mlx90640_probe,
++	.remove		= mlx90640_remove,
++	.id_table	= mlx90640_id,
++};
++module_i2c_driver(mlx90640_driver);
++
++MODULE_AUTHOR("Yifei Chen");
++MODULE_DESCRIPTION("Melexis MLX90640 32x24 thermal array sensor driver");
++MODULE_LICENSE("GPL v2");
