@@ -1,0 +1,36 @@
+# Build outputs
+buildroot/output/
+out/
+build/
+
+# Kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.order
+*.symvers
+modules.builtin
+Module.markers
+.tmp_versions/
+
+# Generated binaries
+app/thermal_cam/thermal_cam
+
+# Images and archives
+*.img
+*.bin
+*.ext4
+*.squashfs
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
