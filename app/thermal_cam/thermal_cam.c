@@ -84,6 +84,8 @@ typedef int64_t  s64;
 #define MLX90640_CTRL_MEAS_MODE_MASK 0x1000
 #define MLX90640_CTRL_RES_MASK       0x0C00
 #define MLX90640_CTRL_RES_SHIFT      10
+#define MLX90640_CTRL_REFRESH_MASK   0x0380
+#define MLX90640_CTRL_REFRESH_SHIFT  7
 
 #define MLX_MS_BYTE(x)          (((x) >> 8) & 0xff)
 #define MLX_LS_BYTE(x)          ((x) & 0xff)
@@ -750,6 +752,37 @@ static int mlx90640_i2c_write_word(int fd, uint16_t reg, uint16_t value)
 	return write(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf) ? 0 : -1;
 }
 
+static uint8_t mlx90640_refresh_code_for_fps(int fps)
+{
+	if (fps <= 1)
+		return 1;	/* 1 Hz */
+	if (fps <= 2)
+		return 2;	/* 2 Hz */
+	if (fps <= 4)
+		return 3;	/* 4 Hz */
+	if (fps <= 8)
+		return 4;	/* 8 Hz */
+	if (fps <= 16)
+		return 5;	/* 16 Hz */
+	if (fps <= 32)
+		return 6;	/* 32 Hz */
+	return 7;		/* 64 Hz */
+}
+
+static int mlx90640_set_refresh_rate(int fd, int fps)
+{
+	uint16_t ctrl;
+	uint8_t code = mlx90640_refresh_code_for_fps(fps);
+
+	if (mlx90640_i2c_read_words(fd, MLX90640_CTRL_REG, &ctrl, 1) < 0)
+		return -1;
+
+	ctrl &= ~MLX90640_CTRL_REFRESH_MASK;
+	ctrl |= (uint16_t)code << MLX90640_CTRL_REFRESH_SHIFT;
+
+	return mlx90640_i2c_write_word(fd, MLX90640_CTRL_REG, ctrl);
+}
+
 static int mlx90640_wait_frame_ready(int fd)
 {
 	uint16_t status;
@@ -1359,7 +1392,7 @@ static int find_mlx90640_i2c(int *bus, int *addr)
 	return 0;
 }
 
-static int mlx90640_direct_i2c_open(struct sensor_ctx *sensor)
+static int mlx90640_direct_i2c_open(struct sensor_ctx *sensor, int refresh_rate)
 {
 	char dev[64];
 	uint16_t ee[MLX90640_EE_WORDS];
@@ -1378,6 +1411,10 @@ static int mlx90640_direct_i2c_open(struct sensor_ctx *sensor)
 	if (ioctl(sensor->fd, I2C_SLAVE_FORCE, sensor->i2c_addr) < 0)
 		goto fail;
 
+	if (mlx90640_set_refresh_rate(sensor->fd, refresh_rate) < 0)
+		fprintf(stderr, "Warning: failed to set MLX90640 refresh rate: %s\n",
+			strerror(errno));
+
 	for (i = 0; i < MLX90640_EE_WORDS; i++) {
 		if (mlx90640_i2c_read_words(sensor->fd, MLX90640_EEPROM_START + i,
 					    &ee[i], 1) < 0)
@@ -1388,8 +1425,8 @@ static int mlx90640_direct_i2c_open(struct sensor_ctx *sensor)
 	sensor->direct_i2c = true;
 	sensor->have_last_to = false;
 
-	printf("Sensor data: direct I2C %s addr 0x%02x (official MLX90640 math)\n",
-	       dev, sensor->i2c_addr);
+	printf("Sensor data: direct I2C %s addr 0x%02x (official MLX90640 math, target %d fps)\n",
+	       dev, sensor->i2c_addr, refresh_rate);
 	return 0;
 
 fail:
@@ -1398,7 +1435,8 @@ fail:
 	return -1;
 }
 
-static int sensor_open(struct sensor_ctx *sensor, const char *dev_path)
+static int sensor_open(struct sensor_ctx *sensor, const char *dev_path,
+		       int refresh_rate)
 {
 	char path[PATH_MAX];
 	int len;
@@ -1406,7 +1444,7 @@ static int sensor_open(struct sensor_ctx *sensor, const char *dev_path)
 	memset(sensor, 0, sizeof(*sensor));
 	sensor->fd = -1;
 
-	if (!dev_path && mlx90640_direct_i2c_open(sensor) == 0)
+	if (!dev_path && mlx90640_direct_i2c_open(sensor, refresh_rate) == 0)
 		return 0;
 
 	if (!dev_path)
@@ -1800,7 +1838,7 @@ static void usage(const char *prog)
 	printf("Options:\n");
 	printf("  -d <fbdev>   Framebuffer device (default: /dev/fb0)\n");
 	printf("  -i <path>    IIO device sysfs path (default: auto-detect)\n");
-	printf("  -r <fps>     Target refresh rate (default: 4)\n");
+	printf("  -r <fps>     Target refresh rate (default: 16, choices up to 64)\n");
 	printf("  -h           Show this help\n");
 }
 
@@ -1811,7 +1849,7 @@ int main(int argc, char *argv[])
 	const char *iiopath = NULL;
 	struct sensor_ctx sensor;
 	s32 *frame;
-	int refresh_rate = 4;
+	int refresh_rate = 16;
 	int opt;
 	struct timespec frame_time, prev_time;
 	double fps = 0.0;
@@ -1828,7 +1866,7 @@ int main(int argc, char *argv[])
 		case 'r':
 			refresh_rate = atoi(optarg);
 			if (refresh_rate < 1 || refresh_rate > 64)
-				refresh_rate = 4;
+				refresh_rate = 16;
 			break;
 		case 'h':
 		default:
@@ -1852,7 +1890,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Open sensor */
-	if (sensor_open(&sensor, iiopath) < 0) {
+	if (sensor_open(&sensor, iiopath, refresh_rate) < 0) {
 		free(frame);
 		return 1;
 	}
@@ -1937,8 +1975,9 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		/* Wait for next frame */
-		usleep(1000000 / refresh_rate);
+		/* Direct I2C already blocks until DATA_READY. */
+		if (!sensor.direct_i2c)
+			usleep(1000000 / refresh_rate);
 	}
 
 	/* Cleanup */
